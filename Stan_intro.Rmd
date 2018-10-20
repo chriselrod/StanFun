@@ -1,0 +1,545 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+Stan is a Probabilistic Programming Language. It is Turing complete $-$ unlike the BUGS lanuage used by the likes of `JAGS`. This means that Stan is a "proper" programming language, giving you the freedom to write anything, putting it in the group of powerful languages like `R` and `Rust` instead of the one-trick ponies like `OpenBUGS` and $\LaTeX$.
+
+Of course, each language was designed differently, and just because you can doesn't mean it is easy or you should. You wouldn't want to explore a data set with `C++` or write a smart phone app in `R`.
+As a probabilistic programming language, you'd probably want to stick with statistical models in Stan. The power comes in flexibility.
+
+But, that doesn't mean we can't... Does everyone know the Fibonacci sequence?
+$0, 1, 1, 2, 3, 5, 8, 13, \ldots$.
+We can easily program a function that calculates this in R:
+```{r}
+setwd("/home/chriselrod/Documents/progwork/Stan")
+library(tidyverse); library(here)
+fibR <- function(n){
+  if (n < 2) return(n)
+  fibR(n-1L) + fibR(n-2L)
+}
+map_int(0L:7L, fibR)
+```
+
+Almost as easily, we can do the same in `Stan`!
+
+```{r}
+library(rstan)
+options(mc.cores = parallel::detectCores()) # We don't need these right now, but
+rstan_options(auto_write = TRUE)            # I always run them before I forget.
+
+fib_Stan_definition <- '
+functions {
+  int fibStan(int n);
+
+  int fibStan(int n) {
+    if (n < 2) return n;
+    return fibStan(n-1) + fibStan(n-2);
+ }
+}'
+
+expose_stan_functions(stanc(model_code = fib_Stan_definition))
+map_int(0L:7L, fibStan)
+
+```
+
+That's not too bad to write!
+For referenec, two popular ways to speed up R programs is to rewrite pieces in either `C++`
+```{r}
+library(Rcpp)
+
+cppFunction(
+  'int fibCpp(int n){
+    if (n < 2) return n;
+    return fibCpp(n-1) + fibCpp(n-2);
+  }'
+)
+map_int(0L:7L, fibCpp)
+```
+
+or Fortran:
+```{r}
+cat('
+module fibonacci
+    implicit none
+
+    contains
+      subroutine fibFortran(fib) bind(C, name = "fibFortran")
+        integer, intent(inout)        :: fib
+  
+        fib = fibRecursion(fib)
+      end subroutine fibFortran
+
+	    recursive function fibRecursion(n) result(fib)
+	    	integer, intent(in), value  :: n
+		    integer  							      :: fib
+
+	    	if (n <= 1) then
+	    		fib = n
+	    	else
+	    		fib = fibRecursion(n - 1) + fibRecursion(n - 2)
+	    	end if
+	    end function fibRecursion
+
+end module fibonacci
+', file = "fibFortran.f90")
+
+system("R CMD SHLIB fibFortran.f90")
+
+dyn.load("fibFortran.so")
+func <- getNativeSymbolInfo("fibFortran")
+fibFortran <- function(n){
+  .Fortran(func, as.integer(n))[[1]]
+}
+map_int(0L:7L, fibFortran)
+```
+
+while this is a lot of boiler plate, Fortran's actually not bad for simple scientific computing. It is a high level language with great built in support for array types and operations. Although I'd strongly recomend learning Julia instead.
+
+The `Stan` language is written in `C++`, and gets translated into C++. It is fast, and if you're running a simulation in `R` that's taking too long, it wouldn't be unreasonable to write parts of it `Stan` just for the sake of speeding it up! Let's choose a big number.
+```{r}
+c(fibR(30), fibStan(30), fibCpp(30), fibFortran(30))
+```
+
+```{r}
+library(microbenchmark)
+microbenchmark(
+  fibR(30),
+  fibStan(30),
+  fibCpp(30),
+  fibFortran(30)
+)
+```
+I was surprised to see Stan so much slower than `C++` and `Fortran`. I am curious why this is.
+
+But till a substantial speed up over the R version. The advantages of using `Stan` are that if you like `Bayes` you've got a great reason to learn it anyway, and that its syntax is the easiest of the three for scientific computing or writing statistical models, and Stan comes out of the box with loads of useful builtin functions.
+Plus an excellent manual whose target audience is you, a statistician.
+
+
+Now that we've got functions down, let's look at a more interesting example.
+
+
+
+```{r}
+ln_iris <- iris %>%
+  mutate(
+    ln.Sepal.Length = log(Sepal.Length),
+    ln.Sepal.Width  = log(Sepal.Width ),
+    ln.Petal.Length = log(Petal.Length),
+    ln.Petal.Width  = log(Petal.Width )
+  )
+  
+ln_iris %>% 
+  group_by(Species) %>%
+  summarise(
+    sd.ln.Sepal.Length = sd(ln.Sepal.Length),
+    sd.ln.Sepal.Width  = sd(ln.Sepal.Width ),
+    sd.ln.Petal.Length = sd(ln.Petal.Length),
+    sd.ln.Petal.Width  = sd(ln.Petal.Width )
+  )
+
+```
+
+```{r}
+set.seed(1)
+subset <- 45
+train <- c(
+  sample.int(50, subset),
+  sample.int(50, subset) + subset,
+  sample.int(50, subset) + 2*subset
+)
+
+iris_mat <- ln_iris[, 6:9] %>% as.matrix() # save for later
+iris_train <- iris_mat[train, ]
+
+iris.kmeans <- kmeans(iris_train, 3)
+iris.kmeans$cluster
+
+```
+
+```{r}
+(iris.kmeans$cluster == c(rep(2,subset),rep(3,subset),rep(1,subset))) %>% mean
+
+```
+
+
+
+```{r message=FALSE, warning=FALSE, result=}
+gen_kmeans <- stan_model(here("generalized_kmeans.stan"))
+
+gen_kmeans_res <- replicate(1e1,
+  optimizing(
+    gen_kmeans,
+    data = list(
+        N = subset*3,
+        K = 3,
+        D = 4,
+        y = iris_train,
+        mu_mu0 = 0,
+        mu_sigma0 = 5,
+        lSigma_mu0 = -2,
+        lSigma_sigma0 = 2,
+        eta = 1,
+        PES = 1000
+    ),
+    # algorithm = "BFGS",
+    as_vector = FALSE,
+    # save_iterations = TRUE,
+    # verbose=TRUE,
+    # tol_obj = 1e-14,
+    # tol_rel_obj = 1e-14,
+    # tol_rel_grad = 1e-12,
+    # tol_param = 1e-12,
+    # init_alpha = 1e-7
+  ),
+  simplify = FALSE
+)
+lps <- map_dbl(gen_kmeans_res,
+        function(x){
+          if(x$return_code == 0){
+            lp <- x$value
+          } else {
+            lp <- -Inf
+          }
+          lp
+        }
+    )
+
+gen_kmeans_result <- gen_kmeans_res %>% pluck(which.max(lps))
+
+
+```
+
+
+
+```{r}
+
+gen_kmeans_assignemnts <- gen_kmeans_result$par$theta %>% 
+  apply(1, which.max)
+gen_kmeans_assignemnts
+
+```
+
+```{r}
+(gen_kmeans_assignemnts == c(rep(1,subset), rep(2, subset), rep(3, subset))) %>% mean
+```
+
+
+
+
+```{r}
+iris_means <- ln_iris %>% 
+  group_by(Species) %>%
+  summarise(
+    mean.ln.Sepal.Length = mean(ln.Sepal.Length),
+    mean.ln.Sepal.Width  = mean(ln.Sepal.Width ),
+    mean.ln.Petal.Length = mean(ln.Petal.Length),
+    mean.ln.Petal.Width  = mean(ln.Petal.Width )
+  )
+iris_means
+
+```
+
+```{r}
+expose_stan_functions(stanc(here("generalized_kmeans.stan")))
+par <- gen_kmeans_result$par
+L_list <- lapply(1:3, function(i) par$L[i,,])
+normal_mixture_lpdf(iris_mat, par$lambda, par$mu, L_list)
+
+```
+
+```{r}
+normal_mixture_fast_lpdf(iris_mat, par$lambda, par$mu, L_list)
+
+```
+
+```{r}
+normal_mixture_fast2_lpdf(iris_mat, par$lambda, par$mu, L_list)
+
+```
+
+```{r}
+iris_mean_mat <- iris_means[,-1] %>% as.matrix()
+iris_L_list <- lapply(
+  0:2, function(i){
+    iris_mat[(1:50) + (50*i),] %>% cov() %>% chol() %>% t
+  }
+)
+
+
+normal_mixture_lpdf(iris_mat, rep(1/3,3), iris_mean_mat, iris_L_list)
+
+```
+
+```{r}
+
+mvnormal_mixtuRe <- function(y, lambda, mu, L){
+  K <- ncol(mu)
+  Li <- lapply(L, solve)
+  loglambda <- log(lambda) + map_dbl(Li, ~ sum(log(diag(.x)))) - 0.5*log(2*pi)*nrow(mu)
+  # browser()
+  sum(
+    apply(y, 2, function(yn){
+      delta <- yn - mu
+      # browser()
+      delta <- sapply(1:K, function(k) Li[[k]] %*% delta[,k])
+      kernels <- loglambda - 0.5 * colSums(delta * delta)
+      log(sum(exp(kernels)))
+    })
+  )
+}
+iris_mat_t <- iris_mat %>% t()
+par_mu_t <- par$mu %>% t()
+mvnormal_mixtuRe(iris_mat_t, par$lambda, par_mu_t, L_list)
+
+```
+
+
+```{r}
+cat('
+module mixture
+
+implicit none
+
+
+contains
+
+
+  subroutine invert_triangle(Ti, logdet, T, N)
+    real(8),  parameter                         :: nhlogtau = -9.189385332046727417803297364056D-01 ! -log(2*pi)/2
+    integer,                  intent(in)        :: N
+    real(8),  dimension(N,N), intent(out)       :: Ti
+    real(8),                  intent(out)       :: logdet
+    real(8),  dimension(N,N), intent(in)        :: T
+    integer                                     :: i, j, k
+    real(8)                                     :: x, y
+
+    logdet = N * nhlogtau ! only because this is for calculating multivariate normal density. Otherwise 0d0.
+    do i = 1,N
+      do j = 1,i-1
+        Ti(j,i) = 0
+      end do
+      Ti(i,i) = 1/T(i,i)
+      logdet = logdet + dlog(Ti(i,i))
+    end do
+    do j = 1,N-1 ! row_displacement
+      do i = 1,N-j ! column
+        x = Ti(j+i,i+1) * T(i+1,i)
+        do k = i+2,j+i
+          x = x + Ti(j+i,k) * T(k,i)
+        end do
+        Ti(j+i,i) = -Ti(i,i) * x
+      end do
+    end do
+
+  end subroutine
+
+  subroutine mvnormal_mixture4(ld, y, lambda, mu, L, N, K) bind(C, name = "MVNormalMixture4")
+    real(8),                      intent(out)   ::  ld
+    integer,                      intent(in)    ::  N, K
+    real(8),  dimension(4, N),    intent(in)    ::  y
+    real(8),  dimension(K),       intent(in)    ::  lambda
+    real(8),  dimension(4, K),    intent(in)    ::  mu
+    real(8),  dimension(4,4, K),  intent(inout) ::  L
+
+    call mvnormal_mixture(ld, y, lambda, mu, L, N, 4, K)
+
+  end subroutine mvnormal_mixture4
+
+  subroutine mvnormal_mixture(ld, y, lambda, mu, L, N, D, K) bind(C, name = "MVNormalMixture")
+    real(8),                      intent(out)   ::  ld
+    integer,                      intent(in)    ::  N, D, K
+    real(8),  dimension(D, N),    intent(in)    ::  y
+    real(8),  dimension(K),       intent(in)    ::  lambda
+    real(8),  dimension(D, K),    intent(in)    ::  mu
+    real(8),  dimension(D,D, K),  intent(inout) ::  L
+
+    real(8),  dimension(K)                      ::  theta, loglambda, LogDets
+    real(8),  dimension(D, D, K)                ::  Li
+    integer                                     ::  i, j
+
+    ld = 0d0
+
+    do j = 1,K
+      call invert_triangle(Li(:,:,j), LogDets(j), L(:,:,j), D)
+    end do
+    loglambda = log(lambda) + LogDets
+
+    do i = 1,N
+      do j = 1,K
+        theta(j) = mvnormal_precision_kernel_lpdf(y(:,i), mu(:,j), Li(:,:,j), D)
+      end do
+      ld = ld + log(sum(exp(loglambda + theta)))
+    end do
+
+  end subroutine mvnormal_mixture
+
+
+  function mvnormal_precision_kernel_lpdf(y, mu, Li, D) result(p)
+    integer,                    intent(in)  ::  D
+    real(8),  dimension(D),     intent(in)  ::  y, mu
+    real(8),  dimension(D, D),  intent(in)  ::  Li
+    real(8)                                 ::  p
+    real(8),  dimension(D)                  ::  delta
+
+    delta = matmul(Li, y - mu)
+    p = - 0.5 * sum(delta*delta)
+
+  end function mvnormal_precision_kernel_lpdf
+
+end module mixture
+', file = "modmix.f90")
+
+
+dyn.unload("modmix.so")
+system("R CMD SHLIB modmix.f90")
+
+dyn.load("modmix.so")
+fortmix <- getNativeSymbolInfo("MVNormalMixture")
+fortmix4 <- getNativeSymbolInfo("MVNormalMixture4")
+fibFortran <- function(y, lambda, mu, L){
+  .Fortran(fortmix, 0, y, lambda, mu, L, ncol(y), nrow(y), length(lambda))[[1]]
+}
+fibFortran4 <- function(y, lambda, mu, L){
+  D <- nrow(y)
+  if (D == 4){
+    lp <- .Fortran(fortmix4, 0, y, lambda, mu, L, ncol(y), length(lambda))[[1]]
+  } else {
+    lp <- .Fortran(fortmix, 0, y, lambda, mu, L, ncol(y), D, length(lambda))[[1]]
+  }
+  lp
+}
+
+
+par_L_t <- par$L %>% aperm(c(2,3,1))
+
+
+fibFortran4(iris_mat_t, par$lambda, par_mu_t, par_L_t)
+
+```
+
+
+
+```{r}
+iris_mean_mat_t <- iris_mean_mat %>% t()
+iris_L <- iris_L_list %>% simplify2array()
+
+fibFortran4(iris_mat_t, rep(1/3,3), iris_mean_mat_t, iris_L)
+
+
+microbenchmark(
+  mvnormal_mixtuRe(iris_mat_t, par$lambda, par_mu_t, L_list),
+  normal_mixture_lpdf(iris_mat, rep(1/3,3), iris_mean_mat, iris_L_list),
+  normal_mixture_fast_lpdf(iris_mat, rep(1/3,3), iris_mean_mat, iris_L_list),
+  normal_mixture_fast2_lpdf(iris_mat, rep(1/3,3), iris_mean_mat, iris_L_list),
+  fibFortran4(iris_mat_t, rep(1/3,3), iris_mean_mat_t, iris_L),
+  fibFortran(iris_mat_t, rep(1/3,3), iris_mean_mat_t, iris_L)
+)
+```
+
+
+```{r}
+
+
+
+train <- c(
+  sample.int(50, 5),
+  sample.int(50, 5) + 50,
+  sample.int(50, 5) + 100
+)
+test <- (1:150)[-train]
+
+
+iris_train <- ln_iris[train,6:9] %>% as.matrix
+iris_test  <- ln_iris[test,6:9] %>% as.matrix
+
+
+
+
+```
+
+
+
+```{r}
+
+iris_matrix <- as.matrix(iris[,1:4])
+
+mixture.res <- stan(
+  here("generalized_kmeans.stan"),
+  data = list(
+    y = iris_matrix,
+    N = nrow(iris_matrix),
+    D = ncol(iris_matrix),
+    K = 3
+  ), chains = 1
+)
+
+```
+
+
+```{r, results='hide'}
+
+
+
+```
+
+
+
+```{r message=TRUE, warning=FALSE, include=FALSE, results='hide'}
+# y <- rbind(
+#   c(172L, 174L, 35L, 819L, 108L, 352L, 45L, 207L),
+#   c(411L, 136L, 62L, 591L, 213L, 247L, 96L, 156L)
+# )
+y <- rbind(
+  c(172, 174, 35, 819, 108, 352, 45, 207),
+  c(411, 136, 62, 591, 213, 247, 96, 156)
+)
+
+binary_misclassification_res <- stan(
+  here("binomial_misclassification.stan"),
+  data = list(
+    y = y,
+    K = 2,
+    alpha_theta = 1,
+    beta_theta = 1,
+    alpha_sensitivity = 1,
+    beta_sensitivity = 1,
+    alpha_specificity = 1,
+    beta_specificity = 1
+  )
+)
+expose_stan_functions(stanc(here("binomial_misclassification.stan")))
+```
+
+```{r}
+binary_misclassification_res
+
+```
+
+
+```{r}
+ylist <- lapply(1:2, function(i) as.integer(y[i,]))
+misclassified_dual_binomial_lpmf(ylist, c(0.11, 0.35), c(0.83,0.99), c(0.74,0.99))
+
+misclassified_dual_binomiald_lpdf(y, c(0.11, 0.35), c(0.83,0.99), c(0.74,0.99))
+
+library(microbenchmark)
+microbenchmark(
+  misclassified_dual_binomial_lpmf(ylist, c(0.11, 0.35), c(0.83,0.99), c(0.74,0.99)),
+  misclassified_dual_binomiald_lpdf(y, c(0.11, 0.35), c(0.83,0.99), c(0.74,0.99))
+)
+```
+
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.

@@ -24,73 +24,93 @@ map_int(0L:7L, fibR)
 
 Almost as easily, we can do the same in `Stan`!
 
+```{stan, output.var="fibStanModel", results='hide'}
+functions {
+  int fibStan(int n);
+  int fibStan(int n) {
+    if (n < 2) return n;
+    return fibStan(n-1) + fibStan(n-2);
+  }
+}
+```
+
+
 ```{r}
 library(rstan)
 options(mc.cores = parallel::detectCores()) # We don't need these right now, but
 rstan_options(auto_write = TRUE)            # I always run them before I forget.
 
-fib_Stan_definition <- '
-functions {
-  int fibStan(int n);
-
-  int fibStan(int n) {
-    if (n < 2) return n;
-    return fibStan(n-1) + fibStan(n-2);
- }
-}'
-
 expose_stan_functions(stanc(model_code = fib_Stan_definition))
 map_int(0L:7L, fibStan)
-
 ```
 
 That's not too bad to write!
-For referenec, two popular ways to speed up R programs is to rewrite pieces in either `C++`
-```{r}
-library(Rcpp)
+For reference, two popular ways to speed up R programs is to rewrite pieces in either `C++`
 
-cppFunction(
-  'int fibCpp(int n){
-    if (n < 2) return n;
-    return fibCpp(n-1) + fibCpp(n-2);
-  }'
-)
+```{Rcpp}
+#include <Rcpp.h>
+using namespace Rcpp;
+
+// [[Rcpp::export]]
+int fibCpp(int n){
+  return n < 2 ? n : fibCpp(n-1) + fibCpp(n-2);
+}
+```
+
+```{r}
 map_int(0L:7L, fibCpp)
 ```
 
-or Fortran:
+or `C`
+```{c, fib-c, results='hide'}
+int fibC(int n){
+  return n < 2 ? n : fibC(n-1) + fibC(n-2);
+}
+
+void fibCwrapper(int *n){
+  *n = fibC(*n);
+}
+```
+Which we must wrap to call from R:
 ```{r}
-cat('
+fibCfunc <- getNativeSymbolInfo("fibCwrapper")
+fibC <- function(n){
+  .C(fibCfunc, as.integer(n))[[1]]
+}
+map_int(0L:7L, fibC)
+```
+
+or Fortran:
+```{r engine='fortran95', results='hide'}
 module fibonacci
     implicit none
 
     contains
-      subroutine fibFortran(fib) bind(C, name = "fibFortran")
-        integer, intent(inout)        :: fib
-  
-        fib = fibRecursion(fib)
-      end subroutine fibFortran
+    subroutine fibFortran(fib) bind(C, name = "fibFortran")
+      integer, intent(inout)        :: fib
+      fib = fibRecursion(fib)
+    end subroutine fibFortran
 
-	    recursive function fibRecursion(n) result(fib)
-	    	integer, intent(in), value  :: n
-		    integer  							      :: fib
-
-	    	if (n <= 1) then
-	    		fib = n
-	    	else
-	    		fib = fibRecursion(n - 1) + fibRecursion(n - 2)
-	    	end if
-	    end function fibRecursion
+    recursive function fibRecursion(n) result(fib)
+    	integer, intent(in), value  :: n
+	    integer  							      :: fib
+    	if (n <= 1) then
+    		fib = n
+    	else
+    		fib = fibRecursion(n - 1) + fibRecursion(n - 2)
+    	end if
+    end function fibRecursion
 
 end module fibonacci
-', file = "fibFortran.f90")
+```
+Fortran is not normally that bad. However, R isn't easily allowed to call `Fortran` functions $-$ only Fortran subroutines $-$ forcing us to write a subroutine that calls the recursive Fibonacci sequence. Subroutines do not return anything, but modify inputs. This is efficient if you're working on large arrays, but functions that return values are better if we're dealing with lots of little integers.
+Fortran defaults to what's fastest for giant arrays, while C and C++ to what's faster for small arrays.
 
-system("R CMD SHLIB fibFortran.f90")
 
-dyn.load("fibFortran.so")
-func <- getNativeSymbolInfo("fibFortran")
+```{r}
+fibFortfunc <- getNativeSymbolInfo("fibFortran")
 fibFortran <- function(n){
-  .Fortran(func, as.integer(n))[[1]]
+  .Fortran(fibFortfunc, as.integer(n))[[1]]
 }
 map_int(0L:7L, fibFortran)
 ```
@@ -99,7 +119,7 @@ while this is a lot of boiler plate, Fortran's actually not bad for simple scien
 
 The `Stan` language is written in `C++`, and gets translated into C++. It is fast, and if you're running a simulation in `R` that's taking too long, it wouldn't be unreasonable to write parts of it `Stan` just for the sake of speeding it up! Let's choose a big number.
 ```{r}
-c(fibR(30), fibStan(30), fibCpp(30), fibFortran(30))
+c(fibR(30), fibStan(30), fibCpp(30), fibC(30), fibFortran(30))
 ```
 
 ```{r}
@@ -108,10 +128,12 @@ microbenchmark(
   fibR(30),
   fibStan(30),
   fibCpp(30),
-  fibFortran(30)
+  fibC(30),
+  fibFortran(30),
+  times = 20L
 )
 ```
-I was surprised to see Stan so much slower than `C++` and `Fortran`. I am curious why this is.
+I was surprised to see Stan so much slower than `C++`, `C`, and `Fortran`. I am curious why this is.
 
 But till a substantial speed up over the R version. The advantages of using `Stan` are that if you like `Bayes` you've got a great reason to learn it anyway, and that its syntax is the easiest of the three for scientific computing or writing statistical models, and Stan comes out of the box with loads of useful builtin functions.
 Plus an excellent manual whose target audience is you, a statistician.
@@ -130,18 +152,22 @@ ln_iris <- iris %>%
     ln.Petal.Width  = log(Petal.Width )
   )
   
-ln_iris %>% 
+iris_means <- ln_iris %>% 
   group_by(Species) %>%
   summarise(
-    sd.ln.Sepal.Length = sd(ln.Sepal.Length),
-    sd.ln.Sepal.Width  = sd(ln.Sepal.Width ),
-    sd.ln.Petal.Length = sd(ln.Petal.Length),
-    sd.ln.Petal.Width  = sd(ln.Petal.Width )
+    mean.ln.Sepal.Length = mean(ln.Sepal.Length),
+    mean.ln.Sepal.Width  = mean(ln.Sepal.Width ),
+    mean.ln.Petal.Length = mean(ln.Petal.Length),
+    mean.ln.Petal.Width  = mean(ln.Petal.Width )
   )
+iris_means
+
 
 ```
 
 ```{r}
+
+
 set.seed(1)
 subset <- 45
 train <- c(
@@ -163,11 +189,70 @@ iris.kmeans$cluster
 
 ```
 
+```{r}
+ln_iris %>% 
+  group_by(Species) %>%
+  summarise(
+    sd.ln.Sepal.Length = sd(ln.Sepal.Length),
+    sd.ln.Sepal.Width  = sd(ln.Sepal.Width ),
+    sd.ln.Petal.Length = sd(ln.Petal.Length),
+    sd.ln.Petal.Width  = sd(ln.Petal.Width )
+  )
+```
 
+
+```{stan, output.var=gen_kmeans, results='hide', warnings=FALSE, messages=FALSE}
+data {
+  int N;
+  int K;
+  int D;
+  vector[D] y[N];
+  real mu_mu0;
+  real mu_sigma0;
+  real lSigma_mu0;
+  real lSigma_sigma0;
+  real eta;
+  real PES;
+}
+transformed data{
+  real alpha = PES / K;
+  real beta = PES - alpha;
+  real neg_log_K = -log(K);
+}
+parameters {
+  vector[D] mu[K];
+  vector<lower=0>[D] Sigma[K];
+  cholesky_factor_corr[D] LKJ[K];
+}
+transformed parameters{
+  real log_density = 0.0;
+  matrix[D,D] L[K];
+  vector[K] theta[N];
+  vector[K] lambda = rep_vector(0, K);
+  for (k in 1:K){
+    L[k] = diag_pre_multiply(Sigma[k], LKJ[k]);
+  }
+  for (n in 1:N){
+    for (k in 1:K){
+      theta[n,k] = exp(neg_log_K + multi_normal_cholesky_lpdf(y[n] | mu[k], L[k]));
+    }
+    lambda += theta[n,:];
+    log_density += log(sum(theta[n,:]));
+  }
+  lambda /= sum(lambda);
+}
+model {
+  target += log_density;
+  lambda ~ beta(alpha, beta);
+  for (k in 1:K){
+    mu[k] ~ normal(mu_mu0, mu_sigma0);
+    Sigma[k] ~ lognormal(lSigma_mu0, lSigma_sigma0);
+    LKJ[k] ~ lkj_corr_cholesky(eta);
+  }
+}
+```
 
 ```{r message=FALSE, warning=FALSE, result=}
-gen_kmeans <- stan_model(here("generalized_kmeans.stan"))
-
 gen_kmeans_res <- replicate(1e1,
   optimizing(
     gen_kmeans,
@@ -183,15 +268,7 @@ gen_kmeans_res <- replicate(1e1,
         eta = 1,
         PES = 1000
     ),
-    # algorithm = "BFGS",
-    as_vector = FALSE,
-    # save_iterations = TRUE,
-    # verbose=TRUE,
-    # tol_obj = 1e-14,
-    # tol_rel_obj = 1e-14,
-    # tol_rel_grad = 1e-12,
-    # tol_param = 1e-12,
-    # init_alpha = 1e-7
+    as_vector = FALSE
   ),
   simplify = FALSE
 )
@@ -222,22 +299,63 @@ gen_kmeans_assignemnts
 ```
 
 ```{r}
-(gen_kmeans_assignemnts == c(rep(1,subset), rep(2, subset), rep(3, subset))) %>% mean
+(gen_kmeans_assignemnts == c(rep(3,subset), rep(1, subset), rep(2, subset))) %>% mean
 ```
 
 
-
+```{stan}
+data {
+  int N;
+  int K;
+  int D;
+  vector[D] y[N];
+  real mu_mu0;
+  real mu_sigma0;
+  real lSigma_mu0;
+  real lSigma_sigma0;
+  real eta;
+  real PES;
+}
+transformed data{
+  real alpha = PES / K;
+  real beta = PES - alpha;
+  real neg_log_K = -log(K);
+}
+parameters {
+  vector[D] mu[K];
+  vector<lower=0>[D] Sigma[K];
+  cholesky_factor_corr[D] LKJ[K];
+}
+transformed parameters{
+  real log_density = 0.0;
+  matrix[D,D] L[K];
+  vector[K] theta[N];
+  vector[K] lambda = rep_vector(0, K);
+  for (k in 1:K){
+    L[k] = diag_pre_multiply(Sigma[k], LKJ[k]);
+  }
+  for (n in 1:N){
+    for (k in 1:K){
+      theta[n,k] = exp(neg_log_K + multi_normal_cholesky_lpdf(y[n] | mu[k], L[k]));
+    }
+    lambda += theta[n,:];
+    log_density += log(sum(theta[n,:]));
+  }
+  lambda /= sum(lambda);
+}
+model {
+  target += log_density;
+  lambda ~ beta(alpha, beta);
+  for (k in 1:K){
+    mu[k] ~ normal(mu_mu0, mu_sigma0);
+    Sigma[k] ~ lognormal(lSigma_mu0, lSigma_sigma0);
+    LKJ[k] ~ lkj_corr_cholesky(eta);
+  }
+}
+```
 
 ```{r}
-iris_means <- ln_iris %>% 
-  group_by(Species) %>%
-  summarise(
-    mean.ln.Sepal.Length = mean(ln.Sepal.Length),
-    mean.ln.Sepal.Width  = mean(ln.Sepal.Width ),
-    mean.ln.Petal.Length = mean(ln.Petal.Length),
-    mean.ln.Petal.Width  = mean(ln.Petal.Width )
-  )
-iris_means
+
 
 ```
 
@@ -439,54 +557,83 @@ microbenchmark(
 ```
 
 
-```{r}
-
-
-
-train <- c(
-  sample.int(50, 5),
-  sample.int(50, 5) + 50,
-  sample.int(50, 5) + 100
-)
-test <- (1:150)[-train]
-
-
-iris_train <- ln_iris[train,6:9] %>% as.matrix
-iris_test  <- ln_iris[test,6:9] %>% as.matrix
 
 
 
 
+
+
+
+
+
+
+```{stan, output.var=binary_misclass, results='hide', warnings=FALSE, messages=FALSE}
+functions{
+  real misclassified_dual_binomial_lpmf(int[,] y, vector theta, real[] S, real[] C){
+    int K = num_elements(theta);
+    vector[K] thetac = 1 - theta;
+    real S1c = 1 - S[1];
+    real S2c = 1 - S[2];
+    real C1c = 1 - C[1];
+    real C2c = 1 - C[2];
+    
+    real S1_S2_ = S[1] * S[2];
+    real S1_S2c = S[1] * S2c ;
+    real S1cS2_ = S1c  * S[2];
+    real S1cS2c = S1c  * S2c ;
+    
+    real C1_C2_ = C[1] * C[2];
+    real C1_C2c = C[1] * C2c ;
+    real C1cC2_ = C1c  * C[2];
+    real C1cC2c = C1c  * C1c ;
+
+    real log_density = 0.0;
+    
+    for (k in 1:K){
+      log_density += multinomial_lpmf(y[k,1:4] | [
+          theta[k]*S1_S2_ + thetac[k]*C1cC2c,  // y[1] ++
+          theta[k]*S1_S2c + thetac[k]*C1cC2_,  // y[2] +-
+          theta[k]*S1cS2_ + thetac[k]*C1_C2c,  // y[2] +-
+          theta[k]*S1cS2c + thetac[k]*C1_C2_   // y[4] --
+        ]');
+      
+      log_density += multinomial_lpmf(y[k,5:6] | [
+          theta[k]*S[1]   + thetac[k]*C1c,
+          theta[k]*S1c    + thetac[k]*C[1]
+        ]');
+      
+      log_density += multinomial_lpmf(y[k,7:8] | [
+          theta[k]*S[2]   + thetac[k]*C2c,
+          theta[k]*S2c    + thetac[k]*C[2]
+        ]');
+    }
+    return log_density;
+  }
+}
+data{
+  int K;
+  int y[K,8];
+  real alpha_theta;
+  real beta_theta;
+  real alpha_sensitivity;
+  real beta_sensitivity;
+  real alpha_specificity;
+  real beta_specificity;
+}
+parameters{
+  vector<lower=0,upper=1>[K] theta;
+  real<lower=0.5,upper=1> sensitivity[2];
+  real<lower=0.5,upper=1> specificity[2];
+}
+model{
+  theta ~ beta(alpha_theta, beta_theta);
+  sensitivity ~ beta(alpha_sensitivity, beta_sensitivity);
+  specificity ~ beta(alpha_specificity, beta_specificity);
+  y ~ misclassified_dual_binomial(theta, sensitivity, specificity);
+}
 ```
 
-
-
-```{r}
-
-iris_matrix <- as.matrix(iris[,1:4])
-
-mixture.res <- stan(
-  here("generalized_kmeans.stan"),
-  data = list(
-    y = iris_matrix,
-    N = nrow(iris_matrix),
-    D = ncol(iris_matrix),
-    K = 3
-  ), chains = 1
-)
-
-```
-
-
-```{r, results='hide'}
-
-
-
-```
-
-
-
-```{r message=TRUE, warning=FALSE, include=FALSE, results='hide'}
+```{r message=TRUE, warning=FALSE, include=FALSE, results='hide', warnings=FALSE, messages=FALSE}
 # y <- rbind(
 #   c(172L, 174L, 35L, 819L, 108L, 352L, 45L, 207L),
 #   c(411L, 136L, 62L, 591L, 213L, 247L, 96L, 156L)
@@ -497,7 +644,8 @@ y <- rbind(
 )
 
 binary_misclassification_res <- stan(
-  here("binomial_misclassification.stan"),
+  binary_misclass
+  # here("binomial_misclassification.stan"),
   data = list(
     y = y,
     K = 2,
@@ -509,13 +657,26 @@ binary_misclassification_res <- stan(
     beta_specificity = 1
   )
 )
-expose_stan_functions(stanc(here("binomial_misclassification.stan")))
+# expose_stan_functions(stanc(here("binomial_misclassification.stan")))
 ```
 
+
+The true values used to generate the data were `c(0.11, 0.35), c(0.83,0.99), c(0.74,0.99)`.
 ```{r}
 binary_misclassification_res
 
 ```
+
+
+
+
+
+
+
+
+
+
+
 
 
 ```{r}
